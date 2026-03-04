@@ -1,0 +1,13 @@
+{
+  "base_model": {
+    "OCA": 0.0,
+    "tIoU@0.5": 0.0,
+    "AA@1": 0.0
+  },
+  "finetuned_model": {
+    "OCA": 0.0,
+    "tIoU@0.5": 0.0,
+    "AA@1": 0.0
+  },
+  "_note": "Placeholder — run evaluate.py with trained model to populate actual scores"
+}
