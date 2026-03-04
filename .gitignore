@@ -27,3 +27,6 @@ data/datasets/
 *.avi
 clips/
 frames/
+training_data/rendered_frames/
+training_data/shards/
+data/

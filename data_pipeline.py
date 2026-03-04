@@ -1,13 +1,16 @@
 """
 Temporal Data Pipeline for OpenPack VLM Fine-Tuning
 
-Downloads OpenPack dataset, extracts clips centered on operation boundaries,
-applies motion-adaptive frame sampling, and generates LLaVA-format training pairs
-for Qwen2.5-VL fine-tuning.
+Processes real OpenPack Zenodo data (Kinect 2D keypoints + operation labels)
+into LLaVA-format training pairs with rendered skeleton frames for
+Qwen2.5-VL fine-tuning.
+
+Data source: https://zenodo.org/records/11059235
+  - kinect-2d-kpt-with-operation-action-labels.zip (preprocessed)
+  - Individual subject zips (U0101-U0210)
 
 Usage:
     python data_pipeline.py --root_dir ./data/datasets --output_dir ./training_data
-    python data_pipeline.py --root_dir ./data/datasets --output_dir ./training_data --save_samples
 """
 
 import argparse
@@ -16,10 +19,8 @@ import io
 import json
 import logging
 import os
-import struct
-import subprocess
-import sys
 import tarfile
+import zipfile
 from collections import defaultdict
 from pathlib import Path
 from typing import Optional
@@ -32,456 +33,422 @@ from tqdm import tqdm
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-# ─── Constants ───────────────────────────────────────────────────────────────
+# ─── Constants (Real OpenPack) ─────────────────────────────────────────────
 
+# Official OpenPack operation classes from:
+# github.com/open-pack/openpack-toolkit/configs/dataset/annotation/openpack-operations.yaml
 OPERATION_CLASSES = {
-    0: "Unknown",
-    100: "Box Setup",
-    200: "Inner Packing",
-    300: "Put Items",
-    400: "Tape",
-    500: "Pack",
-    600: "Wrap",
-    700: "Label",
-    800: "Final Check",
-    900: "Idle",
+    100: "Picking",
+    200: "Relocate Item Label",
+    300: "Assemble Box",
+    400: "Insert Items",
+    500: "Close Box",
+    600: "Attach Box Label",
+    700: "Scan Label",
+    800: "Attach Shipping Label",
+    900: "Put on Back Table",
+    1000: "Fill out Order",
+    8100: "Null",
 }
 
-OPERATION_NAMES = list(OPERATION_CLASSES.values())
+OPERATION_NAMES = [v for k, v in sorted(OPERATION_CLASSES.items())]
 
-# Typical procedural sequence for packaging operations
-OPERATION_SEQUENCE = [
-    "Box Setup",
-    "Inner Packing",
-    "Put Items",
-    "Tape",
-    "Pack",
-    "Wrap",
-    "Label",
-    "Final Check",
-]
+# Valid operations for training (exclude Null)
+VALID_OPERATIONS = {k: v for k, v in OPERATION_CLASSES.items() if v != "Null"}
 
-TRAIN_SUBJECTS = ["U0101", "U0102", "U0103", "U0104", "U0105", "U0106"]
+# Train/val/test split
+TRAIN_SUBJECTS = ["U0101", "U0102", "U0103", "U0105", "U0106"]
 VAL_SUBJECTS = ["U0107"]
 TEST_SUBJECTS = ["U0108"]
 
-TARGET_FPS = 25
+# Kinect 2D keypoints: 17 COCO joints, extracted by MMPose HRNet-W48 at 15fps
+KINECT_FPS = 15
 CLIP_DURATION_SEC = 5.0
-CLIP_FRAMES = int(TARGET_FPS * CLIP_DURATION_SEC)  # 125 frames per 5s clip
-BOUNDARY_OFFSET_SEC = 0.5  # ±0.5s around operation boundaries
+CLIP_FRAMES = int(KINECT_FPS * CLIP_DURATION_SEC)  # 75 frames per 5s clip
+BOUNDARY_OFFSET_SEC = 0.5
 FRAME_SIZE = (336, 336)  # Qwen2.5-VL native resolution
 FRAMES_PER_CLIP = 8  # Frames to sample per clip for training
 
+# COCO 17 keypoints and skeleton connections
+COCO_KEYPOINTS = [
+    "nose", "left_eye", "right_eye", "left_ear", "right_ear",
+    "left_shoulder", "right_shoulder", "left_elbow", "right_elbow",
+    "left_wrist", "right_wrist", "left_hip", "right_hip",
+    "left_knee", "right_knee", "left_ankle", "right_ankle",
+]
 
-# ─── Annotation Loading ─────────────────────────────────────────────────────
+COCO_SKELETON = [
+    (0, 1), (0, 2), (1, 3), (2, 4),  # Head
+    (5, 6),  # Shoulders
+    (5, 7), (7, 9),  # Left arm
+    (6, 8), (8, 10),  # Right arm
+    (5, 11), (6, 12),  # Torso
+    (11, 12),  # Hips
+    (11, 13), (13, 15),  # Left leg
+    (12, 14), (14, 16),  # Right leg
+]
 
-def find_annotation_files(root_dir: str, subject: str) -> list[Path]:
-    """Find operation annotation files for a given subject."""
-    root = Path(root_dir) / "openpack" / subject
-    annotation_patterns = [
-        root / "annotation" / "**" / "*.csv",
-        root / "**" / "operation" / "*.csv",
-        root / "**" / "annotation*.csv",
+# Joint colors (BGR) for visualization
+JOINT_COLORS = {
+    "head": (255, 200, 0),     # Cyan-ish
+    "arm_l": (0, 255, 0),      # Green
+    "arm_r": (0, 0, 255),      # Red
+    "torso": (255, 255, 0),    # Yellow
+    "leg_l": (255, 0, 255),    # Magenta
+    "leg_r": (0, 255, 255),    # Yellow
+}
+
+
+# ─── Data Loading (Preprocessed CSV from Zenodo) ──────────────────────────
+
+def find_preprocessed_csv(root_dir: str) -> Optional[Path]:
+    """Find the preprocessed kinect-2d-kpt CSV files."""
+    root = Path(root_dir)
+
+    # Look for extracted CSV files from kinect-2d-kpt-with-operation-action-labels.zip
+    patterns = [
+        root / "kinect-2d-kpt-with-operation-action-labels" / "**" / "*.csv",
+        root / "kinect-2d-kpt" / "**" / "*.csv",
+        root / "**" / "kinect*2d*kpt*operation*.csv",
+        root / "**" / "*2d*kpt*label*.csv",
     ]
 
     found = []
-    for pattern in annotation_patterns:
-        found.extend(Path(root_dir).glob(str(pattern.relative_to(root_dir))))
-
-    if not found:
-        # Try direct search
-        for f in root.rglob("*.csv"):
-            if "operation" in str(f).lower() or "annotation" in str(f).lower():
-                found.append(f)
+    for pattern in patterns:
+        found.extend(root.glob(str(pattern.relative_to(root))))
 
     return found
 
 
-def load_annotations_csv(csv_path: Path) -> list[dict]:
+def load_preprocessed_keypoint_csv(csv_path: Path) -> dict:
     """
-    Load operation annotations from CSV file.
+    Load preprocessed CSV with Kinect 2D keypoints + operation labels.
 
-    Expected format: timestamp, operation_id (or similar columnar format)
-    Returns list of segments with start_time, end_time, operation.
+    Real format from Zenodo kinect-2d-kpt-with-operation-action-labels:
+      timestamp, operation, action, J00_D0, J00_D1, J00_D2, J01_D0, ...
+    Where each joint Jxx has D0=x, D1=y, D2=confidence (17 joints = 51 values).
+
+    Returns dict with 'timestamps', 'keypoints', 'operations'.
     """
-    segments = []
-    rows = []
+    timestamps = []
+    keypoints = []
+    operations = []
 
     with open(csv_path, "r") as f:
-        reader = csv.reader(f)
-        header = next(reader, None)
-        for row in reader:
-            rows.append(row)
+        reader = csv.DictReader(f)
+        headers = reader.fieldnames
 
-    if not rows:
+        for row in reader:
+            try:
+                ts = int(row.get("timestamp", 0))
+                op = int(row.get("operation", 0))
+
+                # Extract 17 COCO keypoints: J00-J16, each with D0(x), D1(y), D2(conf)
+                kpt_data = []
+                for i in range(17):
+                    x = float(row.get(f"J{i:02d}_D0", 0))
+                    y = float(row.get(f"J{i:02d}_D1", 0))
+                    c = float(row.get(f"J{i:02d}_D2", 0))
+                    kpt_data.append([x, y, c])
+
+                timestamps.append(ts)
+                keypoints.append(kpt_data)
+                operations.append(op)
+            except (ValueError, KeyError):
+                continue
+
+    return {
+        "timestamps": np.array(timestamps),
+        "keypoints": np.array(keypoints),  # (N, 17, 3)
+        "operations": np.array(operations),
+    }
+
+
+def load_subject_data(root_dir: str, subject: str) -> Optional[dict]:
+    """Load keypoint + annotation data for a single subject."""
+    root = Path(root_dir)
+
+    # Search in multiple possible locations
+    search_dirs = [
+        root / "kinect-2d-kpt" / "kinect-2d-kpt-with-operation-action-labels",
+        root / "kinect-2d-kpt-with-operation-action-labels",
+        root / "kinect-2d-kpt",
+        root,
+    ]
+
+    found_csvs = []
+    for search_dir in search_dirs:
+        if search_dir.exists():
+            for f in sorted(search_dir.glob(f"{subject}-S*.csv")):
+                found_csvs.append(f)
+            # Also try without dash
+            for f in sorted(search_dir.glob(f"{subject}_S*.csv")):
+                found_csvs.append(f)
+        if found_csvs:
+            break
+
+    if not found_csvs:
+        logger.warning(f"No keypoint CSV found for {subject}")
+        return None
+
+    # Load all session CSVs for this subject
+    all_data = {"timestamps": [], "keypoints": [], "operations": [], "sessions": []}
+    for csv_path in sorted(set(found_csvs)):
+        logger.info(f"Loading: {csv_path.name}")
+        data = load_preprocessed_keypoint_csv(csv_path)
+        if len(data["timestamps"]) > 0:
+            all_data["timestamps"].append(data["timestamps"])
+            all_data["keypoints"].append(data["keypoints"])
+            all_data["operations"].append(data["operations"])
+            # Extract session ID from filename (e.g. U0101-S0100.csv -> S0100)
+            session = csv_path.stem.split("-")[-1] if "-" in csv_path.stem else "S0100"
+            all_data["sessions"].append((session, len(data["timestamps"])))
+
+    if not all_data["timestamps"]:
+        return None
+
+    return {
+        "timestamps": np.concatenate(all_data["timestamps"]),
+        "keypoints": np.concatenate(all_data["keypoints"]),
+        "operations": np.concatenate(all_data["operations"]),
+        "sessions": all_data["sessions"],
+        "csv_files": found_csvs,
+    }
+
+
+def extract_segments(operations: np.ndarray, timestamps: np.ndarray) -> list[dict]:
+    """Convert frame-level operation labels to segments with start/end times."""
+    segments = []
+    if len(operations) == 0:
         return segments
 
-    # Detect format: could be (timestamp, label) or (start, end, label) etc.
-    n_cols = len(rows[0])
+    current_op = operations[0]
+    start_idx = 0
 
-    if n_cols >= 3:
-        # Format: start_timestamp, end_timestamp, operation_id
-        for row in rows:
-            try:
-                start_ts = int(row[0])
-                end_ts = int(row[1])
-                op_id = int(row[2])
-                op_name = OPERATION_CLASSES.get(op_id, "Unknown")
-                segments.append({
-                    "start_ms": start_ts,
-                    "end_ms": end_ts,
-                    "operation": op_name,
-                    "operation_id": op_id,
-                })
-            except (ValueError, IndexError):
-                continue
-    elif n_cols == 2:
-        # Format: timestamp, operation_id — need to convert to segments
-        timestamps = []
-        for row in rows:
-            try:
-                timestamps.append((int(row[0]), int(row[1])))
-            except ValueError:
-                continue
-
-        if timestamps:
-            segments = _timestamps_to_segments(timestamps)
-
-    return segments
-
-
-def _timestamps_to_segments(timestamps: list[tuple[int, int]]) -> list[dict]:
-    """Convert frame-level (timestamp, label) pairs to segments."""
-    if not timestamps:
-        return []
-
-    segments = []
-    current_label = timestamps[0][1]
-    start_ts = timestamps[0][0]
-
-    for ts, label in timestamps[1:]:
-        if label != current_label:
-            op_name = OPERATION_CLASSES.get(current_label, "Unknown")
+    for i in range(1, len(operations)):
+        if operations[i] != current_op:
+            op_name = OPERATION_CLASSES.get(int(current_op), "Null")
             segments.append({
-                "start_ms": start_ts,
-                "end_ms": ts,
+                "start_idx": int(start_idx),
+                "end_idx": int(i - 1),
+                "start_ts": int(timestamps[start_idx]),
+                "end_ts": int(timestamps[i - 1]),
+                "operation_id": int(current_op),
                 "operation": op_name,
-                "operation_id": current_label,
+                "n_frames": int(i - start_idx),
             })
-            current_label = label
-            start_ts = ts
+            current_op = operations[i]
+            start_idx = i
 
     # Final segment
-    op_name = OPERATION_CLASSES.get(current_label, "Unknown")
+    op_name = OPERATION_CLASSES.get(int(current_op), "Null")
     segments.append({
-        "start_ms": start_ts,
-        "end_ms": timestamps[-1][0],
+        "start_idx": int(start_idx),
+        "end_idx": int(len(operations) - 1),
+        "start_ts": int(timestamps[start_idx]),
+        "end_ts": int(timestamps[-1]),
+        "operation_id": int(current_op),
         "operation": op_name,
-        "operation_id": current_label,
+        "n_frames": int(len(operations) - start_idx),
     })
 
     return segments
 
 
-def load_annotations_from_preprocessed(csv_path: Path) -> list[dict]:
+# ─── Skeleton Rendering ───────────────────────────────────────────────────
+
+def render_skeleton_frame(
+    keypoints: np.ndarray,
+    frame_size: tuple[int, int] = FRAME_SIZE,
+    operation: str = "",
+    frame_num: int = 0,
+    total_frames: int = 0,
+) -> np.ndarray:
     """
-    Load from the preprocessed IMU+operation CSV files from Zenodo.
+    Render a single skeleton frame from 17 COCO keypoints.
 
-    These have columns like: timestamp, acc_x, acc_y, ..., operation
-    We extract the operation column and group into segments.
+    Args:
+        keypoints: (17, 3) array of [x, y, confidence] per joint
+        frame_size: output image dimensions
+        operation: operation label to overlay
+        frame_num: current frame number
+        total_frames: total frames in clip
+    Returns:
+        BGR image as numpy array
     """
-    timestamps = []
+    w, h = frame_size
+    frame = np.zeros((h, w, 3), dtype=np.uint8)
 
-    with open(csv_path, "r") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            ts = int(row.get("unixtime", row.get("timestamp", 0)))
-            op = int(row.get("operation", row.get("operation_id", 0)))
-            timestamps.append((ts, op))
+    # Dark background with subtle grid
+    frame[:] = (30, 30, 30)
+    for gx in range(0, w, 40):
+        cv2.line(frame, (gx, 0), (gx, h), (45, 45, 45), 1)
+    for gy in range(0, h, 40):
+        cv2.line(frame, (0, gy), (w, gy), (45, 45, 45), 1)
 
-    return _timestamps_to_segments(timestamps)
+    # Scale keypoints to frame dimensions
+    # OpenPack Kinect 2D keypoints are in pixel coords (range ~100-950 x, ~230-727 y)
+    # Auto-detect range and scale to fit frame with padding
+    kpts = keypoints.copy()
+    valid_mask = kpts[:, 2] > 0.1  # Only consider confident keypoints
+    if valid_mask.any():
+        valid_x = kpts[valid_mask, 0]
+        valid_y = kpts[valid_mask, 1]
+        if len(valid_x) > 0 and valid_x.max() > valid_x.min():
+            x_min, x_max = valid_x.min(), valid_x.max()
+            y_min, y_max = valid_y.min(), valid_y.max()
+            # Add padding (20% of range)
+            x_pad = max((x_max - x_min) * 0.2, 30)
+            y_pad = max((y_max - y_min) * 0.2, 30)
+            # Scale to frame with padding
+            kpts[:, 0] = (kpts[:, 0] - x_min + x_pad) / (x_max - x_min + 2 * x_pad) * w
+            kpts[:, 1] = (kpts[:, 1] - y_min + y_pad) / (y_max - y_min + 2 * y_pad) * h
 
+    # Draw skeleton connections
+    for (i, j) in COCO_SKELETON:
+        if kpts[i, 2] > 0.3 and kpts[j, 2] > 0.3:  # confidence threshold
+            pt1 = (int(kpts[i, 0]), int(kpts[i, 1]))
+            pt2 = (int(kpts[j, 0]), int(kpts[j, 1]))
 
-def load_subject_annotations(root_dir: str, subject: str) -> list[dict]:
-    """Load all operation annotations for a subject, trying multiple formats."""
-    # Try annotation directory first
-    annot_files = find_annotation_files(root_dir, subject)
+            # Color by body part
+            if i <= 4 or j <= 4:
+                color = JOINT_COLORS["head"]
+            elif i in (5, 7, 9) or j in (5, 7, 9):
+                color = JOINT_COLORS["arm_l"]
+            elif i in (6, 8, 10) or j in (6, 8, 10):
+                color = JOINT_COLORS["arm_r"]
+            elif i in (11, 13, 15) or j in (11, 13, 15):
+                color = JOINT_COLORS["leg_l"]
+            elif i in (12, 14, 16) or j in (12, 14, 16):
+                color = JOINT_COLORS["leg_r"]
+            else:
+                color = JOINT_COLORS["torso"]
 
-    if annot_files:
-        all_segments = []
-        for f in annot_files:
-            logger.info(f"Loading annotations from: {f}")
-            segs = load_annotations_csv(f)
-            if segs:
-                all_segments.extend(segs)
-        if all_segments:
-            return sorted(all_segments, key=lambda s: s["start_ms"])
+            cv2.line(frame, pt1, pt2, color, 2, cv2.LINE_AA)
 
-    # Try preprocessed CSV
-    preprocessed_patterns = [
-        Path(root_dir) / "openpack" / f"*{subject}*operation*.csv",
-        Path(root_dir) / f"*{subject}*.csv",
-    ]
-    for pattern in preprocessed_patterns:
-        for f in Path(root_dir).glob(str(pattern.relative_to(root_dir))):
-            logger.info(f"Loading preprocessed annotations from: {f}")
-            segs = load_annotations_from_preprocessed(f)
-            if segs:
-                return sorted(segs, key=lambda s: s["start_ms"])
+    # Draw joints
+    for i in range(17):
+        if kpts[i, 2] > 0.3:
+            pt = (int(kpts[i, 0]), int(kpts[i, 1]))
+            cv2.circle(frame, pt, 4, (255, 255, 255), -1, cv2.LINE_AA)
+            cv2.circle(frame, pt, 2, (0, 0, 0), -1, cv2.LINE_AA)
 
-    logger.warning(f"No annotations found for subject {subject}")
-    return []
+    # Overlay operation label
+    if operation:
+        cv2.putText(
+            frame, operation, (8, 25),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA,
+        )
 
+    # Frame counter
+    if total_frames > 0:
+        cv2.putText(
+            frame, f"{frame_num}/{total_frames}", (8, h - 10),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (180, 180, 180), 1, cv2.LINE_AA,
+        )
 
-# ─── Video Handling ──────────────────────────────────────────────────────────
-
-def find_video_files(root_dir: str, subject: str) -> list[Path]:
-    """Find Kinect RGB video files for a subject."""
-    root = Path(root_dir) / "openpack" / subject
-    video_patterns = [
-        "kinect/**/*.avi",
-        "kinect/**/*.mp4",
-        "**/*kinect*rgb*.avi",
-        "**/*kinect*rgb*.mp4",
-        "**/*frontal*.avi",
-        "**/*frontal*.mp4",
-    ]
-
-    found = []
-    for pattern in video_patterns:
-        found.extend(root.glob(pattern))
-
-    return sorted(found)
-
-
-def find_frame_directory(root_dir: str, subject: str, session: str) -> Optional[Path]:
-    """Find pre-extracted frame directory for a subject/session."""
-    root = Path(root_dir) / "openpack" / subject
-    frame_patterns = [
-        root / "kinect" / "frames" / session,
-        root / "kinect" / session / "frames",
-        root / "frames" / session,
-    ]
-    for p in frame_patterns:
-        if p.exists():
-            return p
-    return None
+    return frame
 
 
-def extract_frames_from_video(
-    video_path: str,
+def render_clip_frames(
+    keypoints_sequence: np.ndarray,
+    operation: str,
     output_dir: str,
-    target_fps: int = TARGET_FPS,
     frame_size: tuple[int, int] = FRAME_SIZE,
 ) -> int:
     """
-    Pre-extract all frames from video to JPEG at target resolution.
+    Render a sequence of skeleton frames to disk.
 
-    Returns the number of frames extracted.
+    Args:
+        keypoints_sequence: (N, 17, 3) array of keypoints
+        operation: operation label
+        output_dir: directory to save frames
+        frame_size: output image dimensions
+    Returns:
+        number of frames rendered
     """
     os.makedirs(output_dir, exist_ok=True)
+    n_frames = len(keypoints_sequence)
 
-    cmd = [
-        "ffmpeg", "-i", str(video_path),
-        "-vf", f"scale={frame_size[0]}:{frame_size[1]},fps={target_fps}",
-        "-q:v", "2",  # JPEG quality
-        "-start_number", "0",
-        os.path.join(output_dir, "frame_%06d.jpg"),
-        "-y", "-loglevel", "warning",
-    ]
+    for i in range(n_frames):
+        frame = render_skeleton_frame(
+            keypoints_sequence[i], frame_size, operation, i, n_frames
+        )
+        cv2.imwrite(os.path.join(output_dir, f"frame_{i:06d}.jpg"), frame)
 
-    try:
-        subprocess.run(cmd, check=True, capture_output=True, text=True)
-    except subprocess.CalledProcessError as e:
-        logger.error(f"ffmpeg failed: {e.stderr}")
-        return 0
-
-    n_frames = len(list(Path(output_dir).glob("frame_*.jpg")))
-    logger.info(f"Extracted {n_frames} frames from {video_path}")
     return n_frames
 
 
-# ─── Motion-Adaptive Frame Sampling ─────────────────────────────────────────
+# ─── Clip Extraction ─────────────────────────────────────────────────────
 
-def compute_optical_flow_magnitude(
-    frame_dir: str, frame_indices: list[int]
-) -> np.ndarray:
-    """
-    Compute optical flow magnitude between consecutive frames.
-
-    Uses Farneback dense optical flow as a motion proxy.
-    Returns array of motion magnitudes (length = len(frame_indices) - 1).
-    """
-    magnitudes = []
-    prev_gray = None
-
-    for idx in frame_indices:
-        frame_path = os.path.join(frame_dir, f"frame_{idx:06d}.jpg")
-        if not os.path.exists(frame_path):
-            magnitudes.append(0.0)
-            continue
-
-        frame = cv2.imread(frame_path)
-        if frame is None:
-            magnitudes.append(0.0)
-            continue
-
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-        if prev_gray is not None:
-            # Compute dense optical flow
-            flow = cv2.calcOpticalFlowFarneback(
-                prev_gray, gray, None,
-                pyr_scale=0.5, levels=3, winsize=15,
-                iterations=3, poly_n=5, poly_sigma=1.2, flags=0,
-            )
-            mag, _ = cv2.cartToPolar(flow[..., 0], flow[..., 1])
-            magnitudes.append(float(np.mean(mag)))
-
-        prev_gray = gray
-
-    return np.array(magnitudes)
-
-
-def motion_adaptive_sample(
-    frame_dir: str,
-    start_frame: int,
-    end_frame: int,
-    n_samples: int = FRAMES_PER_CLIP,
-) -> list[int]:
-    """
-    Sample frames using motion-adaptive strategy.
-
-    Frames with higher optical flow magnitude (more motion, typically at
-    operation boundaries) are sampled more frequently.
-
-    Strategy:
-    1. Compute optical flow magnitude for subsampled frames in the window
-    2. Create probability distribution weighted by motion magnitude
-    3. Sample n_samples frames from this distribution
-    4. Always include first and last frames
-    """
-    total = end_frame - start_frame
-    if total <= n_samples:
-        return list(range(start_frame, end_frame))
-
-    # Subsample for flow computation (every 5th frame for efficiency)
-    step = max(1, total // 25)
-    probe_indices = list(range(start_frame, end_frame, step))
-
-    if len(probe_indices) < 3:
-        # Not enough frames for flow computation, fall back to uniform
-        return list(np.linspace(start_frame, end_frame - 1, n_samples, dtype=int))
-
-    # Compute motion magnitudes
-    magnitudes = compute_optical_flow_magnitude(frame_dir, probe_indices)
-
-    if len(magnitudes) == 0 or magnitudes.sum() == 0:
-        return list(np.linspace(start_frame, end_frame - 1, n_samples, dtype=int))
-
-    # Build probability distribution
-    # Add small epsilon to ensure all frames have non-zero probability
-    probs = magnitudes + 1e-6
-    probs = probs / probs.sum()
-
-    # Always include first and last frame
-    selected = {probe_indices[0], probe_indices[-1]}
-    remaining = n_samples - 2
-
-    if remaining > 0:
-        # Sample from motion-weighted distribution
-        n_to_sample = min(remaining, len(probs))
-        try:
-            chosen_idx = np.random.choice(
-                len(probs), size=n_to_sample, replace=False, p=probs
-            )
-            for ci in chosen_idx:
-                # Map back to actual frame index
-                actual_frame = probe_indices[ci]
-                selected.add(actual_frame)
-        except ValueError:
-            # Fallback: uniform sampling for remaining
-            uniform = np.linspace(start_frame, end_frame - 1, remaining + 2, dtype=int)
-            selected.update(uniform.tolist())
-
-    # Fill remaining with uniform if needed
-    while len(selected) < n_samples:
-        idx = np.random.randint(start_frame, end_frame)
-        selected.add(idx)
-
-    result = sorted(selected)[:n_samples]
-    return result
-
-
-# ─── Clip Extraction ────────────────────────────────────────────────────────
-
-def extract_boundary_clips(
+def extract_clips(
     segments: list[dict],
-    frame_dir: str,
     total_frames: int,
-    fps: int = TARGET_FPS,
 ) -> list[dict]:
     """
-    Extract clips centered on operation boundaries (±0.5s around transitions).
+    Extract clips from operation segments.
 
-    Also extracts mid-operation clips for balanced coverage.
-
-    Returns list of clip metadata dicts.
+    Creates boundary clips (around transitions) and mid-operation clips.
     """
     clips = []
-    clip_frames_count = int(CLIP_DURATION_SEC * fps)
-    boundary_offset_frames = int(BOUNDARY_OFFSET_SEC * fps)
+    boundary_offset = int(BOUNDARY_OFFSET_SEC * KINECT_FPS)
+    clip_length = CLIP_FRAMES  # 75 frames at 15fps = 5 seconds
 
     for i, seg in enumerate(segments):
-        if seg["operation"] in ("Unknown", "Idle"):
+        if seg["operation"] == "Null":
             continue
 
-        # Convert timestamps to frame indices
-        seg_start_frame = int(seg["start_ms"] / 1000 * fps) if "start_ms" in seg else 0
-        seg_end_frame = int(seg["end_ms"] / 1000 * fps) if "end_ms" in seg else total_frames
+        seg_start = seg["start_idx"]
+        seg_end = seg["end_idx"]
+        seg_len = seg["n_frames"]
 
-        seg_duration = seg_end_frame - seg_start_frame
+        # Next operation for anticipation
+        next_op = "Null"
+        for j in range(i + 1, len(segments)):
+            if segments[j]["operation"] != "Null":
+                next_op = segments[j]["operation"]
+                break
 
-        # Determine next operation for anticipation
-        next_op = "Idle"
-        if i + 1 < len(segments):
-            next_op = segments[i + 1]["operation"]
-
-        # 1. Boundary clip: starts boundary_offset before transition
-        boundary_start = max(0, seg_end_frame - boundary_offset_frames)
-        boundary_end = min(total_frames, boundary_start + clip_frames_count)
-        if boundary_end - boundary_start >= fps:  # At least 1 second
+        # 1. Mid-operation clip (centered in the operation)
+        if seg_len >= KINECT_FPS:  # At least 1 second
+            mid = seg_start + seg_len // 2
+            clip_start = max(0, mid - clip_length // 2)
+            clip_end = min(total_frames, clip_start + clip_length)
             clips.append({
-                "start_frame": boundary_start,
-                "end_frame": boundary_end,
+                "start_idx": clip_start,
+                "end_idx": clip_end,
                 "operation": seg["operation"],
-                "next_operation": next_op,
-                "clip_type": "boundary",
-                "segment_index": i,
-            })
-
-        # 2. Mid-operation clip: centered in the operation
-        if seg_duration > clip_frames_count:
-            mid_point = seg_start_frame + seg_duration // 2
-            mid_start = max(0, mid_point - clip_frames_count // 2)
-            mid_end = min(total_frames, mid_start + clip_frames_count)
-            clips.append({
-                "start_frame": mid_start,
-                "end_frame": mid_end,
-                "operation": seg["operation"],
+                "operation_id": seg["operation_id"],
                 "next_operation": next_op,
                 "clip_type": "mid_operation",
                 "segment_index": i,
             })
 
+        # 2. Boundary clip (around the end of this operation / start of next)
+        if i + 1 < len(segments):
+            boundary_center = seg_end
+            clip_start = max(0, boundary_center - clip_length // 2)
+            clip_end = min(total_frames, clip_start + clip_length)
+            if clip_end - clip_start >= KINECT_FPS:
+                clips.append({
+                    "start_idx": clip_start,
+                    "end_idx": clip_end,
+                    "operation": seg["operation"],
+                    "operation_id": seg["operation_id"],
+                    "next_operation": next_op,
+                    "clip_type": "boundary",
+                    "segment_index": i,
+                })
+
         # 3. Start-of-operation clip
-        op_clip_start = max(0, seg_start_frame - boundary_offset_frames)
-        op_clip_end = min(total_frames, op_clip_start + clip_frames_count)
-        if op_clip_end - op_clip_start >= fps:
+        if seg_len >= clip_length:
+            clip_start = max(0, seg_start - boundary_offset)
+            clip_end = min(total_frames, clip_start + clip_length)
             clips.append({
-                "start_frame": op_clip_start,
-                "end_frame": op_clip_end,
+                "start_idx": clip_start,
+                "end_idx": clip_end,
                 "operation": seg["operation"],
+                "operation_id": seg["operation_id"],
                 "next_operation": next_op,
                 "clip_type": "start_boundary",
                 "segment_index": i,
@@ -490,45 +457,69 @@ def extract_boundary_clips(
     return clips
 
 
-# ─── Training Data Generation ───────────────────────────────────────────────
+def sample_frames_uniform(start_idx: int, end_idx: int, n_samples: int) -> list[int]:
+    """Uniformly sample n_samples frame indices from [start_idx, end_idx)."""
+    total = end_idx - start_idx
+    if total <= n_samples:
+        return list(range(start_idx, end_idx))
+    return list(np.linspace(start_idx, end_idx - 1, n_samples, dtype=int))
 
-TRAIN_SYSTEM_PROMPT = """You are a warehouse operations analyst. Analyze video frames from packaging operations.
 
-Given sequential frames from a 5-second clip, identify:
-1. The dominant packaging operation being performed
-2. Frame indices where the operation starts and ends
-3. What operation comes next in the workflow
+# ─── Training Data Generation ────────────────────────────────────────────
 
-Valid operations: Box Setup, Inner Packing, Tape, Put Items, Pack, Wrap, Label, Final Check, Idle, Unknown
-
-Respond with JSON: {"dominant_operation": "<op>", "temporal_segment": {"start_frame": <int>, "end_frame": <int>}, "anticipated_next_operation": "<op>", "confidence": <float>}"""
+SYSTEM_PROMPT = (
+    "You are a warehouse operations analyst. Analyze skeleton pose frames from "
+    "packaging operations.\n\n"
+    "Given sequential skeleton frames from a 5-second clip at 15fps, identify:\n"
+    "1. The dominant packaging operation being performed\n"
+    "2. Frame indices where the operation starts and ends\n"
+    "3. What operation comes next in the workflow\n\n"
+    "Valid operations: Picking, Relocate Item Label, Assemble Box, Insert Items, "
+    "Close Box, Attach Box Label, Scan Label, Attach Shipping Label, "
+    "Put on Back Table, Fill out Order\n\n"
+    'Respond with JSON: {"dominant_operation": "<op>", '
+    '"temporal_segment": {"start_frame": <int>, "end_frame": <int>}, '
+    '"anticipated_next_operation": "<op>", "confidence": <float>}'
+)
 
 
 def generate_training_pair(
     clip: dict,
-    frame_dir: str,
+    keypoints: np.ndarray,
     subject: str,
     session: str,
     clip_index: int,
+    output_dir: str,
 ) -> dict:
-    """
-    Generate a single LLaVA-format training pair from a clip.
+    """Generate a single LLaVA-format training pair with rendered skeleton frames."""
+    start = clip["start_idx"]
+    end = clip["end_idx"]
+    clip_length = end - start
 
-    Returns dict in Qwen2-VL-Finetune expected format.
-    """
-    # Sample frames using motion-adaptive strategy
-    sampled_indices = motion_adaptive_sample(
-        frame_dir, clip["start_frame"], clip["end_frame"], FRAMES_PER_CLIP
-    )
+    # Sample 8 frames from the clip
+    sampled_indices = sample_frames_uniform(start, end, FRAMES_PER_CLIP)
 
-    # Relative frame indices within the clip
-    rel_start = 0
-    rel_end = clip["end_frame"] - clip["start_frame"] - 1
-
-    # Build clip ID
+    # Render skeleton frames
     clip_id = f"{subject}_{session}_t{clip_index:04d}"
+    frames_dir = os.path.join(output_dir, "rendered_frames", clip_id)
+    os.makedirs(frames_dir, exist_ok=True)
 
-    # Ground truth JSON response
+    for i, idx in enumerate(sampled_indices):
+        if idx < len(keypoints):
+            frame = render_skeleton_frame(
+                keypoints[idx], FRAME_SIZE, clip["operation"],
+                i, len(sampled_indices)
+            )
+            cv2.imwrite(os.path.join(frames_dir, f"frame_{i:02d}.jpg"), frame)
+
+    # Compute relative temporal boundaries
+    # Where does the labeled operation actually occur within the clip?
+    rel_start = 0
+    rel_end = clip_length - 1
+
+    # Confidence based on clip type
+    confidence = 0.90 if clip["clip_type"] == "mid_operation" else 0.75
+
     gt_response = json.dumps({
         "dominant_operation": clip["operation"],
         "temporal_segment": {
@@ -536,322 +527,99 @@ def generate_training_pair(
             "end_frame": rel_end,
         },
         "anticipated_next_operation": clip["next_operation"],
-        "confidence": 0.95,
+        "confidence": round(confidence, 2),
     })
 
-    total_clip_frames = clip["end_frame"] - clip["start_frame"]
-
     user_message = (
-        f"<video>\nAnalyze these {len(sampled_indices)} sequential frames from a "
-        f"5-second warehouse packaging video clip. Total frames in clip: {total_clip_frames}. "
+        f"<video>\nAnalyze these {len(sampled_indices)} sequential skeleton pose "
+        f"frames from a 5-second warehouse packaging clip captured at {KINECT_FPS}fps. "
+        f"Total frames in clip: {clip_length}. "
         f"Identify the dominant packaging operation, its temporal boundaries "
-        f"(frame indices 0 to {total_clip_frames - 1}), and predict the next operation."
+        f"(frame indices 0 to {clip_length - 1}), and predict the next operation."
     )
 
     training_pair = {
         "id": clip_id,
-        "video": f"clips/{clip_id}.mp4",
+        "video": f"rendered_frames/{clip_id}",
         "conversations": [
             {"from": "human", "value": user_message},
             {"from": "gpt", "value": gt_response},
         ],
-        # Metadata for pipeline use (not part of training format)
-        "_meta": {
-            "sampled_frame_indices": sampled_indices,
-            "frame_dir": frame_dir,
-            "clip_start": clip["start_frame"],
-            "clip_end": clip["end_frame"],
-            "clip_type": clip["clip_type"],
-            "subject": subject,
-            "session": session,
-        },
     }
 
     return training_pair
 
 
-def save_clip_as_video(
-    frame_dir: str,
-    sampled_indices: list[int],
-    output_path: str,
-    fps: int = 2,
-    frame_size: tuple[int, int] = FRAME_SIZE,
-):
-    """Save sampled frames as a short video clip for training."""
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(output_path, fourcc, fps, frame_size)
-
-    for idx in sampled_indices:
-        frame_path = os.path.join(frame_dir, f"frame_{idx:06d}.jpg")
-        if os.path.exists(frame_path):
-            frame = cv2.imread(frame_path)
-            if frame is not None:
-                frame = cv2.resize(frame, frame_size)
-                writer.write(frame)
-
-    writer.release()
-
-
-def save_clip_frames(
-    frame_dir: str,
-    sampled_indices: list[int],
-    output_dir: str,
-    frame_size: tuple[int, int] = FRAME_SIZE,
-):
-    """Save sampled frames as individual JPEG files."""
-    os.makedirs(output_dir, exist_ok=True)
-
-    for i, idx in enumerate(sampled_indices):
-        frame_path = os.path.join(frame_dir, f"frame_{idx:06d}.jpg")
-        if os.path.exists(frame_path):
-            frame = cv2.imread(frame_path)
-            if frame is not None:
-                frame = cv2.resize(frame, frame_size)
-                out_path = os.path.join(output_dir, f"frame_{i:02d}.jpg")
-                cv2.imwrite(out_path, frame)
-
-
-# ─── WebDataset Sharding ────────────────────────────────────────────────────
-
-def shard_to_webdataset(
-    training_pairs: list[dict],
-    output_dir: str,
-    shard_size_mb: int = 200,
-):
-    """
-    Pack training data into WebDataset .tar shards for streaming.
-
-    Each sample in the tar contains:
-    - {key}.json: training metadata and conversation
-    - {key}.mp4: video clip (or individual frame JPEGs)
-    """
-    os.makedirs(output_dir, exist_ok=True)
-
-    shard_idx = 0
-    current_size = 0
-    max_shard_bytes = shard_size_mb * 1024 * 1024
-    tar_path = os.path.join(output_dir, f"shard_{shard_idx:04d}.tar")
-    tar = tarfile.open(tar_path, "w")
-
-    for pair in tqdm(training_pairs, desc="Creating WebDataset shards"):
-        key = pair["id"]
-
-        # Add JSON metadata
-        json_data = json.dumps({
-            "id": pair["id"],
-            "video": pair["video"],
-            "conversations": pair["conversations"],
-        }).encode("utf-8")
-
-        json_info = tarfile.TarInfo(name=f"{key}.json")
-        json_info.size = len(json_data)
-        tar.addfile(json_info, io.BytesIO(json_data))
-        current_size += len(json_data)
-
-        # Add frame files if they exist
-        meta = pair.get("_meta", {})
-        frame_dir = meta.get("frame_dir", "")
-        sampled_indices = meta.get("sampled_frame_indices", [])
-
-        for i, idx in enumerate(sampled_indices):
-            frame_path = os.path.join(frame_dir, f"frame_{idx:06d}.jpg")
-            if os.path.exists(frame_path):
-                frame_data = open(frame_path, "rb").read()
-                frame_info = tarfile.TarInfo(name=f"{key}_frame_{i:02d}.jpg")
-                frame_info.size = len(frame_data)
-                tar.addfile(frame_info, io.BytesIO(frame_data))
-                current_size += len(frame_data)
-
-        # Check shard size
-        if current_size >= max_shard_bytes:
-            tar.close()
-            logger.info(
-                f"Shard {shard_idx}: {current_size / 1024 / 1024:.1f} MB"
-            )
-            shard_idx += 1
-            tar_path = os.path.join(output_dir, f"shard_{shard_idx:04d}.tar")
-            tar = tarfile.open(tar_path, "w")
-            current_size = 0
-
-    tar.close()
-    logger.info(f"Created {shard_idx + 1} WebDataset shards in {output_dir}")
-
-
-# ─── Synthetic Data Generation (when RGB unavailable) ────────────────────────
-
-def generate_synthetic_frames(
-    n_frames: int = CLIP_FRAMES,
-    frame_size: tuple[int, int] = FRAME_SIZE,
-    operation: str = "Unknown",
-    output_dir: str = "synthetic_frames",
-) -> str:
-    """
-    Generate synthetic frames for pipeline testing when RGB data is unavailable.
-
-    Creates simple frames with operation text overlay and simulated motion.
-    """
-    os.makedirs(output_dir, exist_ok=True)
-
-    for i in range(n_frames):
-        # Create a base frame with some variation
-        hue = (i / n_frames * 30 + hash(operation) % 180) % 180
-        frame = np.zeros((frame_size[1], frame_size[0], 3), dtype=np.uint8)
-        frame[:, :, 0] = int(hue)  # Hue channel
-        frame[:, :, 1] = 200  # Saturation
-        frame[:, :, 2] = 180 + int(20 * np.sin(2 * np.pi * i / n_frames))  # Value
-
-        frame = cv2.cvtColor(frame, cv2.COLOR_HSV2BGR)
-
-        # Add motion simulation (moving rectangle representing worker)
-        x_pos = int(frame_size[0] * 0.3 + frame_size[0] * 0.4 * np.sin(2 * np.pi * i / n_frames))
-        y_pos = int(frame_size[1] * 0.3 + frame_size[1] * 0.2 * np.cos(2 * np.pi * i / n_frames * 2))
-        cv2.rectangle(frame, (x_pos - 30, y_pos - 50), (x_pos + 30, y_pos + 50), (0, 200, 0), -1)
-
-        # Add operation label
-        cv2.putText(
-            frame, operation, (10, 30),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2,
-        )
-        cv2.putText(
-            frame, f"Frame {i}/{n_frames}", (10, frame_size[1] - 10),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1,
-        )
-
-        cv2.imwrite(os.path.join(output_dir, f"frame_{i:06d}.jpg"), frame)
-
-    return output_dir
-
-
-def generate_synthetic_annotations(n_segments: int = 20) -> list[dict]:
-    """Generate synthetic annotations for pipeline testing."""
-    segments = []
-    current_ms = 0
-
-    ops_cycle = OPERATION_SEQUENCE.copy()
-    for i in range(n_segments):
-        op = ops_cycle[i % len(ops_cycle)]
-        duration_ms = np.random.randint(3000, 15000)  # 3-15 seconds
-        segments.append({
-            "start_ms": current_ms,
-            "end_ms": current_ms + duration_ms,
-            "operation": op,
-            "operation_id": list(OPERATION_CLASSES.keys())[
-                list(OPERATION_CLASSES.values()).index(op)
-            ],
-        })
-        current_ms += duration_ms
-
-    return segments
-
-
-# ─── Main Pipeline ──────────────────────────────────────────────────────────
+# ─── Main Pipeline ───────────────────────────────────────────────────────
 
 def process_subject(
     root_dir: str,
     subject: str,
     output_dir: str,
-    use_synthetic: bool = False,
 ) -> list[dict]:
-    """
-    Process a single subject: load annotations, extract clips, generate training pairs.
-    """
+    """Process a single subject: load real data, extract clips, generate training pairs."""
     logger.info(f"Processing subject: {subject}")
 
-    if use_synthetic:
-        logger.info("Using synthetic data for pipeline testing")
-        segments = generate_synthetic_annotations()
-        frame_dir = generate_synthetic_frames(
-            n_frames=500, operation=segments[0]["operation"],
-            output_dir=os.path.join(output_dir, "synthetic_frames", subject),
-        )
-        total_frames = 500
-        session = "S0100"
-    else:
-        # Load annotations
-        segments = load_subject_annotations(root_dir, subject)
-        if not segments:
-            logger.warning(f"No annotations for {subject}, generating synthetic")
-            segments = generate_synthetic_annotations()
-
-        # Find and process video files
-        videos = find_video_files(root_dir, subject)
-        if not videos:
-            logger.warning(f"No video files for {subject}")
-            # Try to use pre-extracted frames
-            frame_dir = None
-            session = "S0100"
-            # Generate synthetic frames as fallback
-            frame_dir = generate_synthetic_frames(
-                n_frames=500, operation=segments[0]["operation"],
-                output_dir=os.path.join(output_dir, "synthetic_frames", subject),
-            )
-            total_frames = 500
-        else:
-            video_path = videos[0]
-            session = video_path.stem
-            frame_dir = os.path.join(output_dir, "frames", subject, session)
-            total_frames = extract_frames_from_video(
-                str(video_path), frame_dir
-            )
-
-    if total_frames == 0:
-        logger.error(f"No frames available for {subject}")
+    # Load real keypoint + annotation data
+    data = load_subject_data(root_dir, subject)
+    if data is None:
+        logger.error(f"Could not load data for {subject}")
         return []
 
-    # Extract clips centered on boundaries
-    clips = extract_boundary_clips(segments, frame_dir, total_frames)
-    logger.info(f"Extracted {len(clips)} clips for {subject}")
-
-    # Generate training pairs
+    # Process each session separately to avoid cross-session contamination
     training_pairs = []
-    for i, clip in enumerate(clips):
-        pair = generate_training_pair(clip, frame_dir, subject, session, i)
-        training_pairs.append(pair)
+    offset = 0
+    for session_id, n_frames in data["sessions"]:
+        session_timestamps = data["timestamps"][offset:offset + n_frames]
+        session_keypoints = data["keypoints"][offset:offset + n_frames]
+        session_operations = data["operations"][offset:offset + n_frames]
 
+        logger.info(f"  {subject}/{session_id}: {n_frames} frames, {n_frames / KINECT_FPS:.0f}s")
+
+        # Extract operation segments for this session
+        segments = extract_segments(session_operations, session_timestamps)
+        valid_segments = [s for s in segments if s["operation"] != "Null"]
+
+        if not valid_segments:
+            logger.warning(f"  {subject}/{session_id}: no valid segments, skipping")
+            offset += n_frames
+            continue
+
+        # Log operation distribution
+        op_counts = defaultdict(int)
+        for s in valid_segments:
+            op_counts[s["operation"]] += 1
+        for op, count in sorted(op_counts.items(), key=lambda x: -x[1]):
+            logger.info(f"    {op}: {count} segments")
+
+        # Extract clips
+        clips = extract_clips(segments, n_frames)
+        logger.info(f"  {subject}/{session_id}: {len(clips)} clips extracted")
+
+        # Generate training pairs
+        for i, clip in enumerate(clips):
+            pair = generate_training_pair(
+                clip, session_keypoints, subject, session_id,
+                len(training_pairs) + i, output_dir
+            )
+            training_pairs.append(pair)
+
+        offset += n_frames
+
+    logger.info(f"  {subject} total: {len(training_pairs)} training pairs")
     return training_pairs
-
-
-def save_training_samples(
-    training_pairs: list[dict],
-    output_dir: str,
-    n_samples: int = 20,
-):
-    """Save N sample training examples for reviewer verification."""
-    samples_dir = os.path.join(output_dir, "training_data_samples")
-    os.makedirs(samples_dir, exist_ok=True)
-
-    for i, pair in enumerate(training_pairs[:n_samples]):
-        # Save the training pair JSON
-        sample_path = os.path.join(samples_dir, f"sample_{i:03d}.json")
-        sample_data = {
-            "id": pair["id"],
-            "video": pair["video"],
-            "conversations": pair["conversations"],
-        }
-        with open(sample_path, "w") as f:
-            json.dump(sample_data, f, indent=2)
-
-        # Save the sampled frames
-        meta = pair.get("_meta", {})
-        frame_dir = meta.get("frame_dir", "")
-        sampled_indices = meta.get("sampled_frame_indices", [])
-        frames_out = os.path.join(samples_dir, f"sample_{i:03d}_frames")
-        save_clip_frames(frame_dir, sampled_indices, frames_out)
-
-    logger.info(f"Saved {min(n_samples, len(training_pairs))} samples to {samples_dir}")
 
 
 def run_pipeline(
     root_dir: str,
     output_dir: str,
     save_samples: bool = True,
-    use_synthetic: bool = False,
-    create_shards: bool = True,
 ):
-    """Run the full data pipeline."""
+    """Run the full data pipeline on real OpenPack data."""
     os.makedirs(output_dir, exist_ok=True)
+
+    # Check for preprocessed data
+    logger.info(f"Looking for OpenPack data in: {root_dir}")
 
     all_train_pairs = []
     all_val_pairs = []
@@ -859,17 +627,17 @@ def run_pipeline(
 
     # Process training subjects
     for subject in TRAIN_SUBJECTS:
-        pairs = process_subject(root_dir, subject, output_dir, use_synthetic)
+        pairs = process_subject(root_dir, subject, output_dir)
         all_train_pairs.extend(pairs)
 
     # Process validation subjects
     for subject in VAL_SUBJECTS:
-        pairs = process_subject(root_dir, subject, output_dir, use_synthetic)
+        pairs = process_subject(root_dir, subject, output_dir)
         all_val_pairs.extend(pairs)
 
     # Process test subjects
     for subject in TEST_SUBJECTS:
-        pairs = process_subject(root_dir, subject, output_dir, use_synthetic)
+        pairs = process_subject(root_dir, subject, output_dir)
         all_test_pairs.extend(pairs)
 
     logger.info(
@@ -877,37 +645,61 @@ def run_pipeline(
         f"Val: {len(all_val_pairs)}, Test: {len(all_test_pairs)}"
     )
 
-    # Save training data JSON (LLaVA format for Qwen2-VL-Finetune)
-    def strip_meta(pairs):
-        return [
-            {"id": p["id"], "video": p["video"], "conversations": p["conversations"]}
-            for p in pairs
-        ]
+    if not all_train_pairs:
+        logger.error("No training data generated! Check that OpenPack data is in the correct location.")
+        logger.error(f"Expected preprocessed CSVs in: {root_dir}")
+        logger.error("Download from: https://zenodo.org/records/11059235")
+        return None
 
+    # Save training data JSON
     train_json_path = os.path.join(output_dir, "train.json")
     with open(train_json_path, "w") as f:
-        json.dump(strip_meta(all_train_pairs), f, indent=2)
+        json.dump(all_train_pairs, f, indent=2)
 
     val_json_path = os.path.join(output_dir, "val.json")
     with open(val_json_path, "w") as f:
-        json.dump(strip_meta(all_val_pairs), f, indent=2)
+        json.dump(all_val_pairs, f, indent=2)
 
     test_json_path = os.path.join(output_dir, "test.json")
     with open(test_json_path, "w") as f:
-        json.dump(strip_meta(all_test_pairs), f, indent=2)
+        json.dump(all_test_pairs, f, indent=2)
 
     # Save sample training examples
-    if save_samples:
-        save_training_samples(all_train_pairs, ".")
+    if save_samples and all_train_pairs:
+        samples_dir = "training_data_samples"
+        os.makedirs(samples_dir, exist_ok=True)
 
-    # Create WebDataset shards
-    if create_shards and all_train_pairs:
-        shard_to_webdataset(
-            all_train_pairs,
-            os.path.join(output_dir, "shards"),
-        )
+        # Save all samples JSON
+        with open(os.path.join(samples_dir, "all_samples.json"), "w") as f:
+            json.dump(all_train_pairs[:20], f, indent=2)
 
-    logger.info("Pipeline complete!")
+        for i, pair in enumerate(all_train_pairs[:20]):
+            sample_path = os.path.join(samples_dir, f"sample_{i:03d}.json")
+            with open(sample_path, "w") as f:
+                json.dump(pair, f, indent=2)
+
+        logger.info(f"Saved {min(20, len(all_train_pairs))} samples to {samples_dir}")
+
+    # Print summary
+    logger.info("=" * 60)
+    logger.info("PIPELINE SUMMARY")
+    logger.info("=" * 60)
+    logger.info(f"Training pairs:   {len(all_train_pairs)}")
+    logger.info(f"Validation pairs: {len(all_val_pairs)}")
+    logger.info(f"Test pairs:       {len(all_test_pairs)}")
+
+    # Operation distribution
+    all_ops = defaultdict(int)
+    for pair in all_train_pairs:
+        resp = json.loads(pair["conversations"][1]["value"])
+        all_ops[resp["dominant_operation"]] += 1
+    logger.info("Training operation distribution:")
+    for op, count in sorted(all_ops.items(), key=lambda x: -x[1]):
+        pct = count / len(all_train_pairs) * 100
+        logger.info(f"  {op}: {count} ({pct:.1f}%)")
+
+    logger.info("=" * 60)
+
     return {
         "train": len(all_train_pairs),
         "val": len(all_val_pairs),
@@ -918,15 +710,15 @@ def run_pipeline(
     }
 
 
-# ─── CLI ─────────────────────────────────────────────────────────────────────
+# ─── CLI ──────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
-        description="OpenPack Temporal Data Pipeline for VLM Fine-Tuning"
+        description="OpenPack Temporal Data Pipeline for VLM Fine-Tuning (Real Data)"
     )
     parser.add_argument(
         "--root_dir", type=str, default="./data/datasets",
-        help="Root directory of OpenPack dataset",
+        help="Root directory containing OpenPack data (extracted from Zenodo zips)",
     )
     parser.add_argument(
         "--output_dir", type=str, default="./training_data",
@@ -937,15 +729,7 @@ def main():
         help="Save 20 sample training pairs for verification",
     )
     parser.add_argument(
-        "--use_synthetic", action="store_true", default=False,
-        help="Use synthetic data for pipeline testing (when RGB data unavailable)",
-    )
-    parser.add_argument(
-        "--no_shards", action="store_true", default=False,
-        help="Skip WebDataset shard creation",
-    )
-    parser.add_argument(
-        "--n_frames", type=int, default=FRAMES_PER_CLIP,
+        "--n_frames", type=int, default=8,
         help="Number of frames to sample per clip",
     )
     args = parser.parse_args()
@@ -957,8 +741,6 @@ def main():
         root_dir=args.root_dir,
         output_dir=args.output_dir,
         save_samples=args.save_samples,
-        use_synthetic=args.use_synthetic,
-        create_shards=not args.no_shards,
     )
 
 
