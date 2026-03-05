@@ -70,6 +70,7 @@ python3 evaluate.py --test_data ./training_data/test.json --adapter_path ./check
 ## Key Design Decisions
 
 - **Qwen2.5-VL-2B**: Fits T4 16GB with 8.7GB headroom (see ARCHITECTURE.md)
-- **Motion-adaptive sampling**: Optical flow-weighted frame selection at operation boundaries
+- **Motion-adaptive sampling**: Keypoint displacement-weighted frame selection at operation boundaries
 - **QLoRA 4-bit**: NF4 quantization + LoRA rank=64 + gradient checkpointing
 - **Boundary clips**: ±0.5s around operation transitions, not just mid-operation
+- **Label mapping**: Real OpenPack codes mapped to 10 assignment classes (see ARCHITECTURE.md)

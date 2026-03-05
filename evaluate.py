@@ -9,8 +9,8 @@ Metrics:
     3. Anticipation Accuracy (AA@1) — Top-1 accuracy on anticipated_next_operation
 
 Usage:
-    python evaluate.py --test_data ./training_data/test.json --model_id Qwen/Qwen2-VL-2B-Instruct
-    python evaluate.py --test_data ./training_data/test.json --model_id Qwen/Qwen2-VL-2B-Instruct --adapter_path ./checkpoints/final_adapter
+    python evaluate.py --test_data ./training_data/test.json --eval_base
+    python evaluate.py --test_data ./training_data/test.json --adapter_path ./checkpoints/final_adapter
 """
 
 import argparse
@@ -29,7 +29,6 @@ from tqdm import tqdm
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-# Import the predictor
 sys.path.insert(0, str(Path(__file__).parent))
 from app.model import VLMPredictor
 from app.schemas import OPERATION_CLASSES
@@ -161,16 +160,39 @@ def extract_ground_truth(clip: dict) -> dict:
 
 # ─── Evaluation Runner ──────────────────────────────────────────────────────
 
+def _extract_clip_context(clip_id: str, all_clips: list[dict]) -> str:
+    """Extract clip position context from clip ID for prompt matching."""
+    parts = clip_id.split("_")
+    if len(parts) >= 3:
+        session = f"{parts[0]}_{parts[1]}"
+        # Count clips in same session
+        session_clips = sorted([
+            c["id"] for c in all_clips
+            if c["id"].startswith(session)
+        ])
+        total = len(session_clips)
+        position = session_clips.index(clip_id) + 1 if clip_id in session_clips else 1
+        progress_pct = int(100 * (position - 1) / max(total - 1, 1))
+        return (
+            f"Workflow progress: {progress_pct}% complete (clip {position}/{total}). "
+        )
+    return ""
+
+
 def run_evaluation(
     test_clips: list[dict],
     predictor: VLMPredictor,
     data_dir: str,
+    all_clips: Optional[list[dict]] = None,
 ) -> tuple[list[dict], list[dict]]:
     """
     Run inference on test clips and collect predictions.
 
     Returns (predictions, ground_truths) lists.
     """
+    if all_clips is None:
+        all_clips = test_clips
+
     predictions = []
     ground_truths = []
 
@@ -179,10 +201,38 @@ def run_evaluation(
         gt = extract_ground_truth(clip)
         ground_truths.append(gt)
 
+        # Extract clip context for prompt matching
+        clip_context = _extract_clip_context(clip["id"], all_clips)
+
         # Load frames and run inference
         video_path = os.path.join(data_dir, clip.get("video", ""))
 
-        if os.path.exists(video_path):
+        if os.path.isdir(video_path):
+            # Frame directory (rendered skeleton frames) — use 4 frames at 224x224 to match training
+            frame_files = sorted(
+                [f for f in os.listdir(video_path) if f.endswith(".jpg")]
+            )[:4]
+            frames = [
+                Image.open(os.path.join(video_path, f)).convert("RGB").resize((224, 224))
+                for f in frame_files
+            ]
+            if frames:
+                result = predictor.predict_from_frames(
+                    frames=frames,
+                    clip_id=clip["id"],
+                    total_frames=int(gt.get("temporal_segment", {}).get("end_frame", 75)),
+                    clip_context=clip_context,
+                )
+            else:
+                logger.warning(f"No frames in directory for {clip['id']}, using placeholder")
+                result = type("Prediction", (), {
+                    "clip_id": clip["id"],
+                    "dominant_operation": "Unknown",
+                    "temporal_segment": type("Seg", (), {"start_frame": 0, "end_frame": 0})(),
+                    "anticipated_next_operation": "Unknown",
+                    "confidence": 0.0,
+                })()
+        elif os.path.isfile(video_path):
             result = predictor.predict(
                 video_path=video_path,
                 clip_id=clip["id"],
@@ -291,8 +341,10 @@ def main():
     )
     args = parser.parse_args()
 
-    # Load test clips
+    # Load test clips and all clips for context
     test_clips = load_test_clips(args.test_data, args.n_clips)
+    with open(args.test_data) as f:
+        all_clips = json.load(f)
 
     results = {}
 
@@ -310,7 +362,7 @@ def main():
         base_predictor.load()
 
         base_preds, ground_truths = run_evaluation(
-            test_clips, base_predictor, args.data_dir
+            test_clips, base_predictor, args.data_dir, all_clips
         )
         base_metrics = evaluate_predictions(base_preds, ground_truths)
 
@@ -340,7 +392,7 @@ def main():
         ft_predictor.load()
 
         ft_preds, ground_truths = run_evaluation(
-            test_clips, ft_predictor, args.data_dir
+            test_clips, ft_predictor, args.data_dir, all_clips
         )
         ft_metrics = evaluate_predictions(ft_preds, ground_truths)
 

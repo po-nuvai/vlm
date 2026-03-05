@@ -28,25 +28,22 @@ OPERATION_SEQUENCE = [
     "Final Check",
 ]
 
-SYSTEM_PROMPT = """You are a warehouse operations analyst. You analyze video frames from packaging operations in a logistics warehouse.
+SYSTEM_PROMPT = """You are a warehouse operations analyst. Analyze skeleton pose frames from packaging operations.
 
-Given a sequence of video frames from a 5-second clip, you must:
-1. Identify the dominant packaging operation being performed
-2. Determine the start and end frame indices where this operation occurs
-3. Predict what operation comes next in the workflow
+Given sequential skeleton frames from a 5-second clip at 15fps, identify:
+1. The dominant packaging operation being performed
+2. Frame indices where the operation starts and ends
+3. What operation comes next in the workflow
 
-Valid operations: Box Setup, Inner Packing, Tape, Put Items, Pack, Wrap, Label, Final Check, Idle, Unknown
+Valid operations: Box Setup, Inner Packing, Tape, Put Items, Pack, Wrap, Label, Final Check
 
-Typical packaging sequence: Box Setup → Inner Packing → Put Items → Tape → Pack → Wrap → Label → Final Check
+Typical packaging sequence: Box Setup -> Inner Packing -> Put Items -> Tape -> Pack -> Wrap -> Label -> Final Check
 
-Respond ONLY with valid JSON in this exact format:
-{"dominant_operation": "<operation>", "temporal_segment": {"start_frame": <int>, "end_frame": <int>}, "anticipated_next_operation": "<operation>", "confidence": <float 0-1>}"""
+Respond with JSON: {"dominant_operation": "<op>", "temporal_segment": {"start_frame": <int>, "end_frame": <int>}, "anticipated_next_operation": "<op>", "confidence": <float>}"""
 
-USER_PROMPT_TEMPLATE = """Analyze these {n_frames} sequential frames from a 5-second warehouse packaging video clip.
-The frames are sampled at key moments capturing the worker's actions.
+USER_PROMPT_TEMPLATE = """Analyze these {n_frames} sequential skeleton pose frames from a 5-second warehouse packaging clip captured at 15fps.
 Total frames in clip: {total_frames}.
-
-Identify the packaging operation, its temporal boundaries (frame indices 0 to {max_frame}), and predict the next operation."""
+Identify the dominant packaging operation, its temporal boundaries (frame indices 0 to {max_frame}), and predict the next operation."""
 
 
 class VLMPredictor:
@@ -91,6 +88,9 @@ class VLMPredictor:
             self.model = PeftModel.from_pretrained(self.model, self.adapter_path)
 
         self.processor = AutoProcessor.from_pretrained(self.model_id)
+        # Match training image processing settings
+        self.processor.image_processor.min_pixels = 224 * 224
+        self.processor.image_processor.max_pixels = 224 * 224
         self.model.eval()
         logger.info("Model loaded successfully")
 
@@ -241,7 +241,8 @@ class VLMPredictor:
         return self._parse_response(output_text, clip_id, total_frames)
 
     def predict_from_frames(
-        self, frames: list[Image.Image], clip_id: str = "unknown", total_frames: int = 125
+        self, frames: list[Image.Image], clip_id: str = "unknown", total_frames: int = 125,
+        clip_context: str = "",
     ) -> PredictionResponse:
         """Run inference on pre-extracted frames."""
         if not frames:
@@ -258,6 +259,12 @@ class VLMPredictor:
             total_frames=total_frames,
             max_frame=total_frames - 1,
         )
+        if clip_context:
+            # Insert context before "Identify" to match training format
+            user_prompt = user_prompt.replace(
+                "Identify the dominant",
+                f"{clip_context}Identify the dominant",
+            )
 
         image_content = [{"type": "image", "image": frame} for frame in frames]
         messages = [
@@ -302,8 +309,8 @@ class VLMPredictor:
         logger.debug(f"Raw model output: {output_text}")
 
         try:
-            # Try to extract JSON from the response
-            json_match = re.search(r'\{[^{}]*\}', output_text, re.DOTALL)
+            # Try to extract JSON from the response (handle nested braces)
+            json_match = re.search(r'\{.*\}', output_text, re.DOTALL)
             if json_match:
                 parsed = json.loads(json_match.group())
             else:

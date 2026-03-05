@@ -4,11 +4,11 @@
   "conversations": [
     {
       "from": "human",
-      "value": "<video>\nAnalyze these 8 sequential skeleton pose frames from a 5-second warehouse packaging clip captured at 15fps. Total frames in clip: 75. Identify the dominant packaging operation, its temporal boundaries (frame indices 0 to 74), and predict the next operation."
+      "value": "<video>\nAnalyze these 4 sequential skeleton pose frames from a 5-second warehouse packaging clip captured at 15fps (75 total frames). Workflow progress: 0% complete (clip 6 of 587). Identify the dominant packaging operation, its temporal boundaries (frame indices 0 to 74), and predict the next operation."
     },
     {
       "from": "gpt",
-      "value": "{\"dominant_operation\": \"Assemble Box\", \"temporal_segment\": {\"start_frame\": 0, \"end_frame\": 74}, \"anticipated_next_operation\": \"Relocate Item Label\", \"confidence\": 0.9}"
+      "value": "{\"dominant_operation\": \"Box Setup\", \"temporal_segment\": {\"start_frame\": 17, \"end_frame\": 52}, \"anticipated_next_operation\": \"Inner Packing\", \"confidence\": 0.9}"
     }
   ]
 }

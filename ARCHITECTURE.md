@@ -40,6 +40,30 @@ VideoLLaMA2-7B:
 
 **Decision:** Qwen2.5-VL-2B provides the best VRAM efficiency, enabling batch_size=2 with gradient_accumulation=8 (effective BS=16) on free Kaggle T4 GPUs. The 2B parameter count is sufficient for the structured JSON output task, and the model's native multi-image support handles our 8-frame clip inputs natively.
 
+### Data Modality: Skeleton Rendering
+
+The OpenPack dataset's Kinect RGB video requires Google Drive license approval which may not be accessible within the assignment timeframe. As a workaround, we use the freely available **Kinect 2D keypoint data** (17 COCO joints extracted by MMPose HRNet-W48 at 15fps) from the Zenodo download.
+
+We render these keypoints into 336x336 skeleton visualization frames with color-coded body parts (green=left arm, red=right arm, cyan=head, etc.) on a dark grid background. This preserves the spatial pose information that distinguishes operations (e.g., arms raised for "Box Setup" vs. arms forward for "Put Items") while being fully reproducible without the RGB license.
+
+### Operation Class Mapping
+
+The real OpenPack dataset uses numeric operation codes (100-8100) with names like "Picking", "Assemble Box", etc. The assignment defines 10 target classes. We map each OpenPack code to the closest semantic match:
+
+| OpenPack Code | OpenPack Name | Assignment Class | Rationale |
+|---|---|---|---|
+| 300 | Assemble Box | Box Setup | Both = preparing the shipping box |
+| 200 | Relocate Item Label | Inner Packing | Organizing inner contents/labels |
+| 100 | Picking | Put Items | Retrieving items from shelves |
+| 400 | Insert Items | Put Items | Placing products into box |
+| 500 | Close Box | Tape | Sealing the box (taping to close) |
+| 900 | Put on Back Table | Pack | Final packing and staging |
+| 1000 | Fill out Order | Wrap | Wrapping up the order (paperwork) |
+| 600 | Attach Box Label | Label | Applying label to box |
+| 800 | Attach Shipping Label | Label | Applying shipping label |
+| 700 | Scan Label | Final Check | Verification scan |
+| 8100 | Null | Idle | No operation |
+
 ---
 
 ## 2. Frame Sampling Rationale
@@ -76,11 +100,10 @@ Motion-Adaptive Sampling (8 frames):
 
 ### Implementation Details
 
-1. **Probe phase:** Subsample every 5th frame for optical flow computation (efficient)
-2. **Flow computation:** Farneback dense optical flow between consecutive probe frames
-3. **Probability distribution:** Motion magnitudes normalized to probabilities
-4. **Constrained sampling:** First and last frames always included; remaining sampled from motion-weighted distribution
-4. **Fallback:** If motion variance < threshold, revert to uniform (handles static clips)
+1. **Motion computation:** For each consecutive frame pair, compute mean Euclidean displacement of all confident keypoints (confidence > 0.3). This uses the 2D skeleton data directly — no optical flow needed since we have tracked joint positions.
+2. **Probability distribution:** Motion magnitudes normalized to probabilities across all frame transitions.
+3. **Constrained sampling:** First and last frames always included (temporal anchors); remaining 6 frames sampled from motion-weighted distribution without replacement.
+4. **Fallback:** If total motion < threshold or motion variance near zero, revert to uniform spacing (handles static clips where worker is idle).
 
 ### Why This Matters for Temporal Grounding
 
@@ -92,31 +115,31 @@ The tIoU metric requires precise identification of operation start/end frames. U
 
 ### Most Confused Pair: "Tape" vs "Pack"
 
-Based on analysis of the OpenPack operation classes, the most likely confusion pair is **Tape → Pack** (and vice versa).
+Based on analysis of the mapped OpenPack operation classes, the most likely confusion pair is **Tape → Pack** (and vice versa). In the original dataset, "Tape" maps from "Close Box" (code 500) and "Pack" maps from "Put on Back Table" (code 900).
 
 ### Why These Are Confusable
 
-**Visual similarity:**
-- Both operations involve the worker's hands manipulating the box
-- Tape involves applying tape strips to seal the box; Pack involves closing/arranging items in the box
-- From the frontal Kinect view, the hand motions and body posture are nearly identical
-- The box is in a similar orientation for both operations
+**Visual similarity (skeleton poses):**
+- Both operations involve the worker's arms extended forward, manipulating the box
+- Tape (Close Box) involves sealing motions; Pack (Put on Back Table) involves lifting/moving motions
+- From the 2D skeleton alone, the arm positions and torso orientation are nearly identical
+- The distinguishing factor (tape roll vs. lifting the box) is not captured in joint positions
 
 **Temporal ambiguity:**
-- Tape and Pack can occur in rapid succession with very short transitions
-- In some workflows, workers tape while simultaneously rearranging items (blended operation)
+- Tape and Pack often occur in rapid succession — a worker tapes the box shut then immediately moves it
 - The 5-second clip window may capture partial operations from both classes
+- Boundary clips intentionally span these transitions, increasing confusion at the classification level but improving temporal grounding
 
 **Hypothesis for improvement:**
 - Increasing frames_per_clip from 8 to 12 could capture more temporal detail at boundaries
-- Adding explicit temporal position embeddings (frame index / total frames) to the prompt could help the model reason about where in the operation timeline the clip falls
-- Training with boundary-centered clips (our strategy) should reduce this confusion compared to random clips
+- Adding wrist velocity features (computed from keypoint displacements) could help distinguish sealing motions from lifting motions
+- Training with boundary-centered clips (our strategy) should improve tIoU even if OCA suffers at boundaries
 
-### Secondary Confusion: "Inner Packing" vs "Put Items"
+### Secondary Confusion: "Put Items" merges two source operations
 
-Both involve placing objects into a box. "Inner Packing" refers to protective materials (bubble wrap, paper), while "Put Items" is placing the actual products. From the Kinect's overhead angle, these are visually similar except for the objects being handled — which at 336×336 resolution may be too small to distinguish reliably.
+"Put Items" maps from both "Picking" (code 100) and "Insert Items" (code 400). These have different skeleton poses — picking involves reaching to shelves (arms extended upward/sideways) while inserting involves arms forward over the box. The model may learn an averaged representation that reduces classification confidence for both source operations.
 
-### Workarounds Attempted
+### Workarounds
 
-- If OpenPack RGB data is inaccessible (requires Google Drive license approval), we use synthetic data for pipeline validation. This is documented here as a known limitation — real RGB data will improve all metrics.
+- OpenPack RGB data requires Google Drive license approval. We use the freely available Kinect 2D keypoint data from Zenodo and render skeleton frames. This is a known limitation — real RGB data would provide texture/object cues that improve OCA.
 - The anticipation metric (AA@1) partially compensates for classification confusion, since the procedural grammar constrains valid next-operations even when the current operation is misclassified.
