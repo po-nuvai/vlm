@@ -4,6 +4,12 @@ An end-to-end Vision-Language Model pipeline that understands **temporal sequenc
 
 Built on **Qwen2.5-VL-2B** with QLoRA fine-tuning on the **OpenPack** dataset (53+ hours of real warehouse recordings from Zenodo).
 
+## Demo
+
+![Gradio Demo — Skeleton frame analysis with temporal prediction](assets/gradio_demo.png)
+
+*Gradio web interface showing the fine-tuned model analyzing 4 skeleton frames from a packaging clip. The model identifies "Put Items" as the dominant operation (frames 1-7), predicts "Inner Packing" as the next operation, and displays the color-coded skeleton renders used for inference.*
+
 ---
 
 ## The Problem
