@@ -1,57 +1,0 @@
-2026-03-06 02:34:57,823 [INFO] Selected 30 test clips (from 2879 total)
-2026-03-06 02:34:57,830 [INFO] ==================================================
-2026-03-06 02:34:57,830 [INFO] Evaluating BASE model (no fine-tuning)
-2026-03-06 02:34:57,830 [INFO] ==================================================
-2026-03-06 02:34:57,830 [INFO] Loading model: Qwen/Qwen2-VL-2B-Instruct
-`Qwen2VLRotaryEmbedding` can now be fully parameterized by passing the model config through the `config` argument. All other arguments will be removed in v4.46
-2026-03-06 02:35:00,107 [INFO] We will use 90% of the memory on device 0 for storing the model, and 10% for the buffer to avoid OOM. You can set `max_memory` in to a higher value to use more memory (at your own risk).
-Loading checkpoint shards:   0%|          | 0/2 [00:00<?, ?it/s]Loading checkpoint shards:  50%|█████     | 1/2 [00:09<00:09,  9.54s/it]Loading checkpoint shards: 100%|██████████| 2/2 [00:10<00:00,  4.52s/it]Loading checkpoint shards: 100%|██████████| 2/2 [00:10<00:00,  5.27s/it]
-2026-03-06 02:35:15,425 [INFO] Model loaded successfully
-Evaluating:   0%|          | 0/30 [00:00<?, ?it/s]/home/luthuran/miniconda3/envs/vlm/lib/python3.10/site-packages/transformers/generation/configuration_utils.py:601: UserWarning: `do_sample` is set to `False`. However, `temperature` is set to `0.01` -- this flag is only used in sample-based generation modes. You should set `do_sample=True` or unset `temperature`.
-  warnings.warn(
-/home/luthuran/miniconda3/envs/vlm/lib/python3.10/site-packages/transformers/generation/configuration_utils.py:606: UserWarning: `do_sample` is set to `False`. However, `top_p` is set to `0.001` -- this flag is only used in sample-based generation modes. You should set `do_sample=True` or unset `top_p`.
-  warnings.warn(
-/home/luthuran/miniconda3/envs/vlm/lib/python3.10/site-packages/transformers/generation/configuration_utils.py:623: UserWarning: `do_sample` is set to `False`. However, `top_k` is set to `1` -- this flag is only used in sample-based generation modes. You should set `do_sample=True` or unset `top_k`.
-  warnings.warn(
-Evaluating:   3%|▎         | 1/30 [00:03<01:36,  3.32s/it]Evaluating:   7%|▋         | 2/30 [00:05<01:18,  2.80s/it]Evaluating:  10%|█         | 3/30 [00:08<01:10,  2.63s/it]Evaluating:  13%|█▎        | 4/30 [00:10<01:06,  2.57s/it]Evaluating:  17%|█▋        | 5/30 [00:13<01:04,  2.56s/it]Evaluating:  20%|██        | 6/30 [00:16<01:07,  2.83s/it]Evaluating:  23%|██▎       | 7/30 [00:19<01:08,  2.96s/it]Evaluating:  27%|██▋       | 8/30 [00:22<01:01,  2.80s/it]Evaluating:  30%|███       | 9/30 [00:25<01:02,  2.97s/it]Evaluating:  33%|███▎      | 10/30 [00:30<01:13,  3.69s/it]Evaluating:  37%|███▋      | 11/30 [00:33<01:03,  3.35s/it]Evaluating:  40%|████      | 12/30 [00:36<00:56,  3.12s/it]Evaluating:  43%|████▎     | 13/30 [00:38<00:49,  2.93s/it]Evaluating:  47%|████▋     | 14/30 [00:41<00:44,  2.81s/it]Evaluating:  50%|█████     | 15/30 [00:43<00:41,  2.75s/it]Evaluating:  53%|█████▎    | 16/30 [00:47<00:43,  3.14s/it]Evaluating:  57%|█████▋    | 17/30 [01:05<01:36,  7.40s/it]Evaluating:  60%|██████    | 18/30 [01:11<01:24,  7.06s/it]Evaluating:  63%|██████▎   | 19/30 [01:16<01:12,  6.56s/it]Evaluating:  67%|██████▋   | 20/30 [01:21<00:58,  5.90s/it]Evaluating:  70%|███████   | 21/30 [01:25<00:49,  5.54s/it]Evaluating:  73%|███████▎  | 22/30 [01:30<00:43,  5.43s/it]Evaluating:  77%|███████▋  | 23/30 [01:33<00:32,  4.60s/it]Evaluating:  80%|████████  | 24/30 [01:36<00:23,  3.99s/it]Evaluating:  83%|████████▎ | 25/30 [01:38<00:17,  3.55s/it]Evaluating:  87%|████████▋ | 26/30 [01:41<00:12,  3.25s/it]Evaluating:  90%|█████████ | 27/30 [01:43<00:09,  3.00s/it]Evaluating:  93%|█████████▎| 28/30 [01:46<00:05,  2.84s/it]Evaluating:  97%|█████████▋| 29/30 [01:48<00:02,  2.71s/it]Evaluating: 100%|██████████| 30/30 [01:50<00:00,  2.61s/it]Evaluating: 100%|██████████| 30/30 [01:50<00:00,  3.70s/it]
-2026-03-06 02:37:06,334 [INFO] Base model results: {
-  "OCA": 0.1333,
-  "tIoU@0.5": 0.9667,
-  "AA@1": 0.1667
-}
-2026-03-06 02:37:06,335 [INFO] Base model top confusions: [('Label → Put Items', 6), ('Box Setup → Put Items', 3), ('Tape → Put Items', 3), ('Final Check → Put Items', 3), ('Pack → Put Items', 3)]
-2026-03-06 02:37:06,372 [INFO] ==================================================
-2026-03-06 02:37:06,372 [INFO] Evaluating FINE-TUNED model
-2026-03-06 02:37:06,372 [INFO] ==================================================
-2026-03-06 02:37:06,372 [INFO] Loading model: Qwen/Qwen2-VL-2B-Instruct
-2026-03-06 02:37:07,612 [INFO] We will use 90% of the memory on device 0 for storing the model, and 10% for the buffer to avoid OOM. You can set `max_memory` in to a higher value to use more memory (at your own risk).
-Loading checkpoint shards:   0%|          | 0/2 [00:00<?, ?it/s]Loading checkpoint shards:  50%|█████     | 1/2 [00:08<00:08,  8.57s/it]Loading checkpoint shards: 100%|██████████| 2/2 [00:09<00:00,  4.17s/it]Loading checkpoint shards: 100%|██████████| 2/2 [00:09<00:00,  4.83s/it]
-2026-03-06 02:37:18,236 [INFO] Loading LoRA adapter from: ./checkpoints/final_adapter
-2026-03-06 02:37:23,244 [INFO] Model loaded successfully
-Evaluating:   0%|          | 0/30 [00:00<?, ?it/s]Evaluating:   3%|▎         | 1/30 [00:03<01:33,  3.21s/it]Evaluating:   7%|▋         | 2/30 [00:06<01:33,  3.33s/it]Evaluating:  10%|█         | 3/30 [00:11<01:50,  4.08s/it]Evaluating:  13%|█▎        | 4/30 [00:15<01:41,  3.92s/it]Evaluating:  17%|█▋        | 5/30 [00:19<01:44,  4.18s/it]Evaluating:  20%|██        | 6/30 [00:23<01:34,  3.93s/it]Evaluating:  23%|██▎       | 7/30 [00:26<01:25,  3.73s/it]Evaluating:  27%|██▋       | 8/30 [00:34<01:51,  5.09s/it]Evaluating:  30%|███       | 9/30 [00:37<01:34,  4.52s/it]Evaluating:  33%|███▎      | 10/30 [00:41<01:22,  4.13s/it]Evaluating:  37%|███▋      | 11/30 [00:44<01:13,  3.87s/it]Evaluating:  40%|████      | 12/30 [00:47<01:07,  3.73s/it]Evaluating:  43%|████▎     | 13/30 [00:51<01:01,  3.64s/it]Evaluating:  47%|████▋     | 14/30 [00:54<00:56,  3.54s/it]Evaluating:  50%|█████     | 15/30 [00:58<00:52,  3.51s/it]Evaluating:  53%|█████▎    | 16/30 [01:01<00:48,  3.49s/it]Evaluating:  57%|█████▋    | 17/30 [01:05<00:45,  3.49s/it]Evaluating:  60%|██████    | 18/30 [01:08<00:41,  3.48s/it]Evaluating:  63%|██████▎   | 19/30 [01:11<00:38,  3.46s/it]Evaluating:  67%|██████▋   | 20/30 [01:15<00:34,  3.41s/it]Evaluating:  70%|███████   | 21/30 [01:18<00:30,  3.36s/it]Evaluating:  73%|███████▎  | 22/30 [01:21<00:26,  3.32s/it]Evaluating:  77%|███████▋  | 23/30 [01:24<00:23,  3.29s/it]Evaluating:  80%|████████  | 24/30 [01:28<00:19,  3.26s/it]Evaluating:  83%|████████▎ | 25/30 [01:31<00:16,  3.27s/it]Evaluating:  87%|████████▋ | 26/30 [01:34<00:13,  3.27s/it]Evaluating:  90%|█████████ | 27/30 [01:37<00:09,  3.26s/it]Evaluating:  93%|█████████▎| 28/30 [01:41<00:06,  3.24s/it]Evaluating:  97%|█████████▋| 29/30 [01:44<00:03,  3.23s/it]Evaluating: 100%|██████████| 30/30 [01:47<00:00,  3.24s/it]Evaluating: 100%|██████████| 30/30 [01:47<00:00,  3.58s/it]
-2026-03-06 02:39:10,748 [INFO] Fine-tuned model results: {
-  "OCA": 0.2,
-  "tIoU@0.5": 1.0,
-  "AA@1": 0.1
-}
-2026-03-06 02:39:10,748 [INFO] Fine-tuned model top confusions: [('Label → Put Items', 6), ('Inner Packing → Put Items', 3), ('Box Setup → Put Items', 3), ('Tape → Put Items', 3), ('Final Check → Put Items', 3)]
-2026-03-06 02:39:10,796 [INFO] 
-Results saved to: results_v6.json
-2026-03-06 02:39:10,796 [INFO] ==================================================
-2026-03-06 02:39:10,796 [INFO] EVALUATION SUMMARY
-2026-03-06 02:39:10,796 [INFO] ==================================================
-2026-03-06 02:39:10,796 [INFO] 
-base_model:
-2026-03-06 02:39:10,796 [INFO]   OCA: 0.1333
-2026-03-06 02:39:10,796 [INFO]   tIoU@0.5: 0.9667
-2026-03-06 02:39:10,796 [INFO]   AA@1: 0.1667
-2026-03-06 02:39:10,796 [INFO] 
-finetuned_model:
-2026-03-06 02:39:10,796 [INFO]   OCA: 0.2
-2026-03-06 02:39:10,796 [INFO]   tIoU@0.5: 1.0
-2026-03-06 02:39:10,796 [INFO]   AA@1: 0.1
-2026-03-06 02:39:10,796 [INFO] 
-Improvement (delta):
-2026-03-06 02:39:10,796 [INFO]   OCA: +0.0667
-2026-03-06 02:39:10,796 [INFO]   tIoU@0.5: +0.0333
-2026-03-06 02:39:10,796 [INFO]   AA@1: -0.0667
